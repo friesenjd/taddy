@@ -47,7 +47,7 @@ global TADDY_TCLSH
 global TADDY_TOOL
 
 set TADDY_DEBUG false      ;# set to "true" to get debug trace messages printed to stdout
-                           ;# and generated script.
+                           ;# and "taddy_debug.log"
 set TADDY_TCLSH tclsh8.5   ;# set to executable name of Tcl in your environment
                            ;# This should resolve to a tclsh binary that is equivalent
                            ;# in version to your tools' Tcl version (e.g. 8.4, 8.5, etc.)
@@ -59,8 +59,7 @@ if {[llength [info commands conformal_news]]} {
 } elseif {[llength [info vars rc_mode]]} {
     set TADDY_TOOL rc
 } else {
-    #error "Unsupported tool for shim!"
-    set TADDY_TOOL unknown
+    error "Unsupported tool for shim!"
 }
 
 
@@ -77,7 +76,7 @@ if {[llength [info commands conformal_news]]} {
 # to the master interpreter. Required to get several Tcl built-ins, including package 
 # handling. Applies recursively.
 #
-set copied_namespaces {::tcl}
+set copied_namespaces {::tcl ::msgcat}
 
 #
 # These namespaces should be aliased directly without a shim wrapper. Only works if there
@@ -88,13 +87,11 @@ set aliased_namespaces {}
 
 #
 # Individual procedures to copy. Like $copied_namespaces, but more granular.
-# Useful for cases where EDA tool has overridden a Tcl built-in.
+# Useful for cases where EDA tool has overridden a Tcl built-in, or we need
+# to copy a built-in Tcl procedure to the slave interpreter
 #
-set copied_procs [list redirect]
+set copied_procs [list redirect pkg_mkIndex tclPkgUnknown]
 
-if {$TADDY_TOOL == "conformal"} {
-    lappend copied_procs tclPkgUnknown
-}
 if {$TADDY_TOOL == "rc"} {
     lappend copied_procs unknown
 }
@@ -135,9 +132,15 @@ if {$TADDY_TOOL == "rc"} {
 # so as not to include any vendor-specific commands
 set tcl_commands [exec echo {puts [join [lsort [info commands]] \n]} | $TADDY_TCLSH]
 
+# Don't expose taddy commands to slave
+lappend tcl_commands taddy 
+lappend tcl_commands debug
+
 # Tool-specific amendments are below
 if {$TADDY_TOOL == "rc"} {
-    # Commands to remove from alias exclusion.
+    # Commands to remove from alias exclusion. These are commands that we want 
+    # unrolled as part of execution of the user's scripts
+
     # TODO: determine why these are required and document the reason, or remove
     foreach command_to_remove {
         apply
@@ -154,17 +157,17 @@ if {$TADDY_TOOL == "rc"} {
     }
 
     # Commands to add to alias exclusion
-    lappend tcl_commands pkg_mkIndex   ;# Custom RC command for loading packages
-    lappend tcl_commands tclPkgUnknown ;#   ""   ""
-    lappend tcl_commands redirect      ;# RC built-in for IO redirection. 
-    lappend tcl_commands tcl_source    ;# RC's alias for Tcl "source" builtin
+     
+    # RC built-in for IO redirection. Usually contains blocks of user code.
+    lappend tcl_commands redirect
+    # RC's alias for Tcl "source" builtin.
+    lappend tcl_commands tcl_source
 }
 
 if {$TADDY_TOOL == "conformal"} {
     # Nothing to add/remove
 }
 
-lappend tcl_commands taddy 
 
 ##############################################################################
 # Procedures
@@ -222,7 +225,7 @@ proc create_shim {tool_proc {flexible false}} {
                 if {![llength [info procs $tool_proc]]} {
                     proc $tool_proc args " 
                         global shim_fh
-                        puts \$shim_fh \"# bypassed: $tool_proc \$args\"
+                        debug \$shim_fh \"# bypassed: $tool_proc \$args\"
                         return 0
                     "
                 }
@@ -263,7 +266,7 @@ proc create_shim {tool_proc {flexible false}} {
                 puts \$shim_fh \"$tool_proc \$args\"
                 set __ret__ \[eval \"::$tool_proc \$args\"]
                 set level \[taddy eval info level]
-                puts \"start: \$level\"
+                debug \"start: \$level\"
                 for {set i 0} {\$i < \$level} {incr i} {
                     debug \"\$i => \[taddy eval info level \$i]\"
                 }
@@ -373,9 +376,9 @@ proc taddy_setup {capture_script_path} {
     
     # edit code to enable debugging
     if {$TADDY_DEBUG} {
-        set debug_fh [open debug.log w]
+        set debug_fh [open taddy_debug.log w]
     }
-    set shim_fh  [open shim_log.txt w]
+    set shim_fh  [open $capture_script_path w]
 
     # Delete previous taddy interpreter and environment, if they exist
     if {[interp exists taddy]} {
@@ -451,9 +454,9 @@ proc taddy_setup {capture_script_path} {
         copy_ns $current_ns
     }
 
-    # Copy select procedures from master to slave, without shimming
+    # Copy select procedures from master to slave, without shimming, overwriting previously-existing shim
     foreach p $copied_procs  {
-        if {[info exists $p]} {
+        if {[llength [info proc $p]]} {
 	        taddy eval [list proc $p [info args $p] [info body $p]]
 	    } else {
 	    	debug "Warning: procedure '$p' of 'copied_procs' does not exist."
